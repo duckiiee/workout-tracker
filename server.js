@@ -1,5 +1,7 @@
-require('dotenv').config();
-
+// Chỉ đọc file .env nếu đang ở máy cá nhân (development)
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
