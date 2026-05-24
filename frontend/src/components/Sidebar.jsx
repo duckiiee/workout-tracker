@@ -1,5 +1,5 @@
+import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
-
 const navItems = [
   {
     to: '/dashboard',
@@ -54,40 +54,72 @@ const navItems = [
     ),
   },
 ];
-
-function linkClass({ isActive }) {
-  return [
-    'flex items-center gap-3 rounded-xl px-4 py-3 text-sm font-medium transition',
-    isActive
-      ? 'bg-gray-900/90 text-white shadow-md shadow-black/10 backdrop-blur-sm'
-      : 'text-gray-500 hover:bg-white/50 hover:text-gray-900',
-  ].join(' ');
-}
-
 export default function Sidebar() {
+  const [isOpen, setIsOpen] = useState(true);
+
   return (
-    <aside className="glass-sidebar relative z-10 flex w-64 shrink-0 flex-col">
-      <div className="border-b border-gray-300 px-8 py-8">
-        <p className="page-kicker">FitTrack</p>
-        <h1 className="mt-2 text-xl font-bold tracking-tight text-gray-900">
-          Workout
-          <span className="font-medium text-gray-400"> Pro</span>
-        </h1>
+    <aside 
+      className={`glass-sidebar relative z-10 flex shrink-0 flex-col transition-all duration-300 ease-in-out ${
+        isOpen ? 'w-64' : 'w-20'
+      }`}
+    >
+      {/* Nút Toggle nằm ngay trên thành Sidebar */}
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="absolute -right-3 top-8 z-50 flex h-6 w-6 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-500 shadow-sm transition hover:text-gray-900 hover:shadow-md"
+      >
+        {isOpen ? (
+          <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M15 19l-7-7 7-7" />
+          </svg>
+        ) : (
+          <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M9 5l7 7-7 7" />
+          </svg>
+        )}
+      </button>
+
+      {/* Header */}
+      <div className="border-b border-gray-300 px-6 py-8 overflow-hidden whitespace-nowrap">
+        <p className={`page-kicker ${!isOpen && 'hidden'}`}>FitTrack</p>
+        {isOpen && (
+          <h1 className="mt-2 text-xl font-bold tracking-tight text-gray-900">
+            Workout<span className="font-medium text-gray-400"> Pro</span>
+          </h1>
+        )}
       </div>
 
-      <nav className="flex-1 space-y-1 p-4">
+      {/* Nav items */}
+      <nav className="flex-1 space-y-2 p-4">
         {navItems.map((item) => (
-          <NavLink key={item.to} to={item.to} className={linkClass}>
+          <NavLink 
+            key={item.to} 
+            to={item.to} 
+            className={({ isActive }) => 
+              `flex items-center gap-3 rounded-xl px-4 py-3 text-sm font-medium transition ${
+                isActive 
+                  ? 'bg-gray-900/90 text-white shadow-md' 
+                  : 'text-gray-500 hover:bg-white/50 hover:text-gray-900'
+              } ${!isOpen && 'justify-center px-0'}`
+            }
+          >
             {item.icon}
-            {item.label}
+            {isOpen && <span className="whitespace-nowrap">{item.label}</span>}
           </NavLink>
         ))}
       </nav>
 
+      {/* Version footer */}
       <div className="border-t border-gray-300 p-4">
-        <div className="glass-inset p-4">
-          <p className="text-sm font-medium text-gray-500">Phiên bản</p>
-          <p className="mt-0.5 text-sm font-semibold text-gray-900">v1.0 — Beta</p>
+        <div className="glass-inset p-3 text-center">
+          {isOpen ? (
+            <>
+              <p className="text-xs font-medium text-gray-500">Phiên bản</p>
+              <p className="mt-0.5 text-xs font-semibold text-gray-900">v1.0 — Beta</p>
+            </>
+          ) : (
+            <p className="text-xs font-bold text-gray-400">v1</p>
+          )}
         </div>
       </div>
     </aside>
