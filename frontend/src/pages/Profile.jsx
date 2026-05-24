@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { format } from 'date-fns';
 import { vi } from 'date-fns/locale';
 
-const API_BASE = 'http://localhost:5000/api';
+import { API_BASE } from '../config/api';
 
 function formatRecordDate(dateStr) {
   const iso = dateStr?.includes?.('T') ? dateStr : `${dateStr}T00:00:00`;

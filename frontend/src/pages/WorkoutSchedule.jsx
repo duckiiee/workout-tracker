@@ -10,7 +10,7 @@ import {
 } from 'date-fns';
 import { vi } from 'date-fns/locale';
 
-const API_BASE = 'http://localhost:5000/api';
+import { API_BASE } from '../config/api';
 const WEEK_OPTS = { weekStartsOn: 1 };
 
 const inputClass = 'apple-input-sm';

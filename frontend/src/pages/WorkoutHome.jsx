@@ -4,8 +4,9 @@
  * return <WorkoutHome />;
  */
 import { useCallback, useEffect, useState } from 'react';
+import { API_BASE } from '../config/api';
 
-const API_URL = 'http://localhost:5000/api/workouts';
+const WORKOUTS_API = `${API_BASE}/workouts`;
 
 function formatDate(dateString) {
   const date = new Date(dateString);
@@ -60,7 +61,7 @@ export default function WorkoutHome() {
     if (!silent) setLoading(true);
     setError(null);
     try {
-      const response = await fetch(API_URL);
+      const response = await fetch(WORKOUTS_API);
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.message || 'Không thể tải danh sách.');
       setWorkouts(result.data);
@@ -80,7 +81,7 @@ export default function WorkoutHome() {
     setSubmitting(true);
     setError(null);
     try {
-      const response = await fetch(API_URL, {
+      const response = await fetch(WORKOUTS_API, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ WorkoutDate: workoutDate, Notes: notes.trim() }),
@@ -102,7 +103,7 @@ export default function WorkoutHome() {
     setDeletingId(workoutId);
     setError(null);
     try {
-      const response = await fetch(`${API_URL}/${workoutId}`, { method: 'DELETE' });
+      const response = await fetch(`${WORKOUTS_API}/${workoutId}`, { method: 'DELETE' });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.message || 'Không thể xóa.');
       setWorkouts((prev) => prev.filter((w) => w.WorkoutID !== workoutId));

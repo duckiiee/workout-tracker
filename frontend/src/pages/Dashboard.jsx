@@ -11,8 +11,7 @@ import {
 import { format } from 'date-fns';
 import { vi } from 'date-fns/locale';
 import { CHART, CHART_TOOLTIP_STYLE } from '../constants/chartTheme';
-
-const API_BASE = 'http://localhost:5000/api';
+import { API_BASE } from '../config/api';
 
 function calcBmi(weightKg, heightCm) {
   if (weightKg == null || heightCm == null || heightCm <= 0) return null;

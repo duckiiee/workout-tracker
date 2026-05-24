@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 
-const API_BASE = 'http://localhost:5000/api';
+import { API_BASE } from '../config/api';
 
 function muscleBadgeClass() {
   return 'bg-gray-100 text-gray-700 border-gray-300';
