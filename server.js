@@ -148,7 +148,27 @@ async function withTransaction(fn) {
   }
 }
 
-app.use(cors());
+// Cho phép mọi origin (localhost, Vercel, Netlify, …). Thu hẹp bằng CORS_ORIGINS nếu cần.
+const corsOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin:
+      corsOrigins.length > 0
+        ? (origin, callback) => {
+            if (!origin || corsOrigins.includes(origin)) {
+              callback(null, true);
+            } else {
+              callback(new Error(`CORS blocked for origin: ${origin}`));
+            }
+          }
+        : true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  })
+);
 app.use(express.json());
 
 function parseId(value, name = 'ID') {
