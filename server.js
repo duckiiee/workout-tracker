@@ -1,29 +1,128 @@
-// Chỉ đọc file .env nếu đang ở máy cá nhân (development)
-if (process.env.NODE_ENV !== 'production') {
-  require('dotenv').config();
-}
+require('dotenv').config();
+
+const dns = require('dns');
+const dnsPromises = dns.promises;
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 
-const app = express();
-const PORT = process.env.PORT || 5000;
+// Render không có route IPv6 ra internet → bắt buộc IPv4
+dns.setDefaultResultOrder('ipv4first');
 
-// Supabase PostgreSQL (Session mode — port 5432). Pool dùng cùng thông số với Client.
-const dbConfig = {
-  user: 'postgres',
-  host: 'db.glcydvwcipxapugljsen.supabase.co',
-  database: 'postgres',
-  password: 'Hoangduc02@',
-  port: 6543,
-  ssl: { rejectUnauthorized: false },
-  family: 4
-};
+const app = express();
+const PORT = Number(process.env.PORT) || 5000;
 
 let pool;
 
+function resolveDbFamily() {
+  const family = Number(process.env.FAMILY);
+  return family === 4 || family === 6 ? family : 4;
+}
+
+function supabaseProjectRefFromDirectHost(host) {
+  const match = host.match(/^db\.([a-z0-9]+)\.supabase\.co$/i);
+  return match ? match[1] : null;
+}
+
+function buildPoolConfig() {
+  const host =
+    process.env.DB_HOST ||
+    process.env.DB_SERVER ||
+    'db.glcydvwcipxapugljsen.supabase.co';
+  let user = process.env.DB_USER || 'postgres';
+  const password = process.env.DB_PASSWORD || '';
+  const database = process.env.DB_DATABASE || 'postgres';
+
+  const isPooler = host.includes('pooler.supabase.com');
+  let port = Number(process.env.DB_PORT);
+
+  // Session pooler = 5432 (IPv4). Port 6543 = transaction mode (dễ lỗi trên Render).
+  if (!Number.isFinite(port) || port <= 0) {
+    port = 5432;
+  } else if (port === 6543 && process.env.DB_POOL_MODE !== 'transaction') {
+    console.warn('DB_PORT 6543 → dùng 5432 (session pooler). Set DB_POOL_MODE=transaction nếu cần 6543.');
+    port = 5432;
+  }
+
+  const ref = supabaseProjectRefFromDirectHost(host);
+  if (isPooler && ref && !user.includes('.')) {
+    user = `postgres.${ref}`;
+  }
+
+  return {
+    host,
+    port,
+    user,
+    password,
+    database,
+    ssl: { rejectUnauthorized: false },
+    family: resolveDbFamily(),
+  };
+}
+
+/** db.*.supabase.co thường chỉ có IPv6; Render cần pooler (có IPv4). */
+async function preparePoolConfigForRender(config) {
+  const originalHost = config.host;
+
+  try {
+    const ipv4List = await dnsPromises.resolve4(originalHost);
+    if (ipv4List.length > 0) {
+      config.host = ipv4List[0];
+      return { config, mode: 'ipv4-direct' };
+    }
+  } catch (err) {
+    if (err.code !== 'ENODATA' && err.code !== 'ENOTFOUND') {
+      throw err;
+    }
+  }
+
+  const ref = supabaseProjectRefFromDirectHost(originalHost);
+  if (!ref) {
+    throw new Error(
+      `Host ${originalHost} has no IPv4 (ENODATA). On Render, set DB_HOST to your Supabase pooler host (aws-0-REGION.pooler.supabase.com) and DB_USER=postgres.${ref || 'PROJECT_REF'}.`
+    );
+  }
+
+  const region = process.env.SUPABASE_REGION || 'ap-northeast-2';
+  const poolerCandidates = [
+    process.env.DB_POOLER_HOST,
+    `aws-1-${region}.pooler.supabase.com`,
+    `aws-0-${region}.pooler.supabase.com`,
+  ].filter(Boolean);
+
+  config.port = 5432;
+  if (!config.user.includes('.')) {
+    config.user = `postgres.${ref}`;
+  }
+
+  let lastError;
+  for (const poolerHost of [...new Set(poolerCandidates)]) {
+    try {
+      const ipv4List = await dnsPromises.resolve4(poolerHost);
+      if (!ipv4List.length) continue;
+
+      config.host = ipv4List[0];
+      return {
+        config,
+        mode: 'pooler-session',
+        poolerHost,
+        projectRef: ref,
+      };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('Could not resolve Supabase pooler host to IPv4.');
+}
+
 function formatConnectionError(err) {
   const parts = [err.message, err.code].filter(Boolean);
+  if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.code === 'ENETUNREACH') {
+    parts.push(
+      'Use DB_HOST + DB_PORT=5432 for db.*.supabase.co, set FAMILY=4, remove stale DATABASE_URL on Render. IPv6 (2406:...) often fails on Render.'
+    );
+  }
   if (err.errors?.length) {
     parts.push(...err.errors.map((e) => e.message || String(e)).filter(Boolean));
   }
@@ -1326,10 +1425,32 @@ app.use((req, res) => {
 });
 
 async function connectDatabase() {
+  const config = buildPoolConfig();
+
+  if (!config.password) {
+    console.error(
+      'Database connection failed: DB_PASSWORD is not set. Add it in Render → Environment.'
+    );
+    process.exit(1);
+  }
+
   try {
-    pool = new Pool(dbConfig);
+    const prepared = await preparePoolConfigForRender(config);
+    const { config: readyConfig, mode, poolerHost, projectRef } = prepared;
+
+    pool = new Pool(readyConfig);
     await pool.query('SELECT 1');
-    console.log('Database connected successfully');
+
+    if (mode === 'pooler-session') {
+      console.log(
+        `Database connected via Supabase pooler (IPv4 ${readyConfig.host}:${readyConfig.port}, user ${readyConfig.user}, pooler ${poolerHost}, ref ${projectRef})`
+      );
+    } else {
+      console.log(
+        `Database connected (IPv4 ${readyConfig.host}:${readyConfig.port}, user ${readyConfig.user})`
+      );
+    }
+
     return pool;
   } catch (err) {
     console.error('Database connection failed:', formatConnectionError(err));
@@ -1340,8 +1461,8 @@ async function connectDatabase() {
 async function startServer() {
   await connectDatabase();
 
-  app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server is running on port ${PORT}`);
   });
 }
 
