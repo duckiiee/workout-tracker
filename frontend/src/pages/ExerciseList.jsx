@@ -13,11 +13,14 @@ export default function ExerciseList() {
 
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
+
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(null);
 
   const fetchExercises = useCallback(async ({ silent = false } = {}) => {
     if (!silent) setLoading(true);
+
     setError(null);
 
     try {
@@ -31,7 +34,10 @@ export default function ExerciseList() {
       setExercises(result.data);
     } catch (err) {
       setError(err.message || 'Không thể tải danh sách bài tập.');
-      if (!silent) setExercises([]);
+
+      if (!silent) {
+        setExercises([]);
+      }
     } finally {
       if (!silent) setLoading(false);
     }
@@ -43,6 +49,7 @@ export default function ExerciseList() {
 
   async function handleSubmit(e) {
     e.preventDefault();
+
     if (!name.trim() || submitting) return;
 
     setSubmitting(true);
@@ -52,7 +59,9 @@ export default function ExerciseList() {
     try {
       const response = await fetch(`${API_BASE}/exercises`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
           Name: name.trim(),
           MuscleGroup: muscleGroup.trim() || null,
@@ -67,12 +76,53 @@ export default function ExerciseList() {
 
       setName('');
       setMuscleGroup('');
+
       setSuccess(`Đã thêm "${result.data.Name}".`);
+
       await fetchExercises({ silent: true });
     } catch (err) {
       setError(err.message || 'Không thể thêm bài tập.');
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function handleDelete(exerciseId, exerciseName) {
+    const confirmed = window.confirm(
+      `Bạn có chắc muốn xóa bài tập "${exerciseName}"?`
+    );
+
+    if (!confirmed) return;
+
+    setDeletingId(exerciseId);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const response = await fetch(
+        `${API_BASE}/exercises/${exerciseId}`,
+        {
+          method: 'DELETE',
+        }
+      );
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || 'Không thể xóa bài tập.');
+      }
+
+      setExercises((prev) =>
+        prev.filter(
+          (exercise) => exercise.ExerciseID !== exerciseId
+        )
+      );
+
+      setSuccess(`Đã xóa "${exerciseName}".`);
+    } catch (err) {
+      setError(err.message || 'Không thể xóa bài tập.');
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -89,8 +139,14 @@ export default function ExerciseList() {
     <div className="page-shell mx-auto max-w-4xl">
       <header>
         <p className="page-kicker">Thư viện</p>
-        <h1 className="page-title">Danh sách bài tập</h1>
-        <p className="page-desc">Quản lý bài tập và nhóm cơ trong hệ thống.</p>
+
+        <h1 className="page-title">
+          Danh sách bài tập
+        </h1>
+
+        <p className="page-desc">
+          Quản lý bài tập và nhóm cơ trong hệ thống.
+        </p>
       </header>
 
       {error && (
@@ -98,6 +154,7 @@ export default function ExerciseList() {
           {error}
         </div>
       )}
+
       {success && (
         <div role="status" className="alert-success">
           {success}
@@ -105,14 +162,26 @@ export default function ExerciseList() {
       )}
 
       <section className="apple-card-lg">
-        <h2 className="card-title">Thêm bài tập mới</h2>
-        <p className="card-subtitle mb-6">Tạo bài tập để dùng trong lịch tập</p>
+        <h2 className="card-title">
+          Thêm bài tập mới
+        </h2>
 
-        <form onSubmit={handleSubmit} className="grid gap-5 sm:grid-cols-2">
+        <p className="card-subtitle mb-6">
+          Tạo bài tập để dùng trong lịch tập
+        </p>
+
+        <form
+          onSubmit={handleSubmit}
+          className="grid gap-5 sm:grid-cols-2"
+        >
           <div>
-            <label htmlFor="exerciseName" className="apple-label">
+            <label
+              htmlFor="exerciseName"
+              className="apple-label"
+            >
               Tên bài
             </label>
+
             <input
               id="exerciseName"
               type="text"
@@ -126,9 +195,13 @@ export default function ExerciseList() {
           </div>
 
           <div>
-            <label htmlFor="muscleGroup" className="apple-label">
+            <label
+              htmlFor="muscleGroup"
+              className="apple-label"
+            >
               Nhóm cơ
             </label>
+
             <input
               id="muscleGroup"
               type="text"
@@ -141,8 +214,14 @@ export default function ExerciseList() {
           </div>
 
           <div className="sm:col-span-2">
-            <button type="submit" disabled={submitting} className="btn-primary">
-              {submitting ? 'Đang thêm...' : 'Thêm bài tập'}
+            <button
+              type="submit"
+              disabled={submitting}
+              className="btn-primary"
+            >
+              {submitting
+                ? 'Đang thêm...'
+                : 'Thêm bài tập'}
             </button>
           </div>
         </form>
@@ -150,8 +229,13 @@ export default function ExerciseList() {
 
       <section>
         <div className="mb-6 flex items-end justify-between">
-          <h2 className="card-title">Tất cả bài tập</h2>
-          <span className="badge-pill">{exercises.length} bài</span>
+          <h2 className="card-title">
+            Tất cả bài tập
+          </h2>
+
+          <span className="badge-pill">
+            {exercises.length} bài
+          </span>
         </div>
 
         {exercises.length === 0 ? (
@@ -165,22 +249,41 @@ export default function ExerciseList() {
                 key={exercise.ExerciseID}
                 className="glass-card transition hover:shadow-lg"
               >
-                <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0 flex-1">
                     <span className="text-xs font-medium text-gray-400">
                       #{exercise.ExerciseID}
                     </span>
+
                     <h3 className="mt-1 truncate text-lg font-semibold text-black">
                       {exercise.Name}
                     </h3>
+
+                    {exercise.MuscleGroup && (
+                      <span
+                        className={`mt-3 inline-block rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide ${muscleBadgeClass()}`}
+                      >
+                        {exercise.MuscleGroup}
+                      </span>
+                    )}
                   </div>
-                  {exercise.MuscleGroup && (
-                    <span
-                      className={`shrink-0 rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide ${muscleBadgeClass()}`}
-                    >
-                      {exercise.MuscleGroup}
-                    </span>
-                  )}
+
+                  <button
+                    onClick={() =>
+                      handleDelete(
+                        exercise.ExerciseID,
+                        exercise.Name
+                      )
+                    }
+                    disabled={
+                      deletingId === exercise.ExerciseID
+                    }
+                    className="rounded-xl bg-red-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {deletingId === exercise.ExerciseID
+                      ? 'Đang xóa...'
+                      : 'Xóa'}
+                  </button>
                 </div>
               </li>
             ))}
