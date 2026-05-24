@@ -9,56 +9,20 @@ const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Supabase PostgreSQL (Session mode — port 5432). Pool dùng cùng thông số với Client.
+const dbConfig = {
+  user: 'postgres',
+  host: 'db.glcydvwcipxapugljsen.supabase.co',
+  database: 'postgres',
+  password: 'Hoangduc02@',
+  port: 5432,
+  ssl: { rejectUnauthorized: false },
+};
+
 let pool;
-
-function buildPoolConfig() {
-  if (process.env.DATABASE_URL) {
-    return {
-      connectionString: process.env.DATABASE_URL,
-      ssl:
-        process.env.DB_SSL === 'false'
-          ? false
-          : { rejectUnauthorized: false },
-    };
-  }
-
-  const host = process.env.DB_HOST || process.env.DB_SERVER;
-  const port = Number(process.env.DB_PORT) || 5432;
-
-  if (!host || !process.env.DB_USER || !process.env.DB_PASSWORD || !process.env.DB_DATABASE) {
-    throw new Error(
-      'Database config missing. Set DATABASE_URL or DB_HOST/DB_SERVER, DB_USER, DB_PASSWORD, DB_DATABASE (and optional DB_PORT).'
-    );
-  }
-
-  const isLocalHost =
-    host === 'localhost' || host === '127.0.0.1' || host === '::1';
-  const useSsl =
-    process.env.DB_SSL === 'true' ||
-    (process.env.DB_SSL !== 'false' && !isLocalHost);
-
-  return {
-    host,
-    port,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_DATABASE,
-    ssl: useSsl ? { rejectUnauthorized: false } : false,
-  };
-}
 
 function formatConnectionError(err) {
   const parts = [err.message, err.code].filter(Boolean);
-  if (err.code === 'ECONNREFUSED') {
-    parts.push(
-      'No PostgreSQL server accepted the connection. For Supabase, use DATABASE_URL from the dashboard (not SQL Server localhost settings).'
-    );
-  }
-  if (err.code === 'ERR_INVALID_URL') {
-    parts.push(
-      'DATABASE_URL is malformed. Remove placeholder brackets [], use real Supabase host/user, and encode @ in passwords as %40 — or use DB_HOST, DB_USER, DB_PASSWORD instead.'
-    );
-  }
   if (err.errors?.length) {
     parts.push(...err.errors.map((e) => e.message || String(e)).filter(Boolean));
   }
@@ -1362,7 +1326,7 @@ app.use((req, res) => {
 
 async function connectDatabase() {
   try {
-    pool = new Pool(buildPoolConfig());
+    pool = new Pool(dbConfig);
     await pool.query('SELECT 1');
     console.log('Database connected successfully');
     return pool;
