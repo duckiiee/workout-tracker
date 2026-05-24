@@ -2,23 +2,85 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const sql = require('mssql');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const dbConfig = {
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  server: process.env.DB_SERVER,
-  database: process.env.DB_DATABASE,
-  options: {
-    encrypt: true,
-    trustServerCertificate: true,
-  },
-};
-
 let pool;
+
+function buildPoolConfig() {
+  if (process.env.DATABASE_URL) {
+    return {
+      connectionString: process.env.DATABASE_URL,
+      ssl:
+        process.env.DB_SSL === 'false'
+          ? false
+          : { rejectUnauthorized: false },
+    };
+  }
+
+  const host = process.env.DB_HOST || process.env.DB_SERVER;
+  const port = Number(process.env.DB_PORT) || 5432;
+
+  if (!host || !process.env.DB_USER || !process.env.DB_PASSWORD || !process.env.DB_DATABASE) {
+    throw new Error(
+      'Database config missing. Set DATABASE_URL or DB_HOST/DB_SERVER, DB_USER, DB_PASSWORD, DB_DATABASE (and optional DB_PORT).'
+    );
+  }
+
+  const isLocalHost =
+    host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  const useSsl =
+    process.env.DB_SSL === 'true' ||
+    (process.env.DB_SSL !== 'false' && !isLocalHost);
+
+  return {
+    host,
+    port,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_DATABASE,
+    ssl: useSsl ? { rejectUnauthorized: false } : false,
+  };
+}
+
+function formatConnectionError(err) {
+  const parts = [err.message, err.code].filter(Boolean);
+  if (err.code === 'ECONNREFUSED') {
+    parts.push(
+      'No PostgreSQL server accepted the connection. For Supabase, use DATABASE_URL from the dashboard (not SQL Server localhost settings).'
+    );
+  }
+  if (err.code === 'ERR_INVALID_URL') {
+    parts.push(
+      'DATABASE_URL is malformed. Remove placeholder brackets [], use real Supabase host/user, and encode @ in passwords as %40 — or use DB_HOST, DB_USER, DB_PASSWORD instead.'
+    );
+  }
+  if (err.errors?.length) {
+    parts.push(...err.errors.map((e) => e.message || String(e)).filter(Boolean));
+  }
+  return parts.join(' — ') || String(err);
+}
+
+async function query(text, params = [], client = pool) {
+  return client.query(text, params);
+}
+
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
 app.use(cors());
 app.use(express.json());
@@ -49,7 +111,7 @@ function sendError(res, err, defaultMessage = 'Internal server error') {
 }
 
 const WORKOUT_COLUMNS =
-  'WorkoutID, WorkoutDate, Notes, IsCompleted';
+  '"WorkoutID", "WorkoutDate", "Notes", "IsCompleted"';
 
 function parseDateQuery(value, paramName = 'date') {
   if (value === undefined || value === null || value === '') return null;
@@ -62,14 +124,14 @@ function parseDateQuery(value, paramName = 'date') {
 }
 
 function handleDbError(err) {
-  if (err.number === 547) {
+  if (err.code === '23503') {
     const error = new Error(
       'Cannot complete operation due to a related record constraint.'
     );
     error.statusCode = 409;
     return error;
   }
-  if (err.number === 2627 || err.number === 2601) {
+  if (err.code === '23505') {
     const error = new Error('A record with this value already exists.');
     error.statusCode = 409;
     return error;
@@ -372,33 +434,34 @@ function validateDefaultScheduleBody(body, { partial = false } = {}) {
 }
 
 const DEFAULT_SCHEDULE_COLUMNS =
-  'ds.TemplateID, ds.DayOfWeek, ds.ExerciseID, ds.Sets, ds.Reps, ds.Weight';
+  'ds."TemplateID", ds."DayOfWeek", ds."ExerciseID", ds."Sets", ds."Reps", ds."Weight"';
 
 const DEFAULT_SCHEDULE_SELECT = `
   SELECT ${DEFAULT_SCHEDULE_COLUMNS},
-         e.Name AS ExerciseName, e.MuscleGroup
-  FROM DefaultWeeklySchedule ds
-  INNER JOIN Exercises e ON ds.ExerciseID = e.ExerciseID
+         e."Name" AS "ExerciseName", e."MuscleGroup"
+  FROM "DefaultWeeklySchedule" ds
+  INNER JOIN "Exercises" e ON ds."ExerciseID" = e."ExerciseID"
 `;
 
 // --- User Profile ---
 
 app.get('/api/profile', async (req, res) => {
   try {
-    const result = await pool.request().query(`
-      SELECT TOP 1 ProfileID, FullName, Height, TargetGoal
-      FROM UserProfile
-      ORDER BY ProfileID
+    const result = await query(`
+      SELECT "ProfileID", "FullName", "Height", "TargetGoal"
+      FROM "UserProfile"
+      ORDER BY "ProfileID"
+      LIMIT 1
     `);
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'User profile not found.',
       });
     }
 
-    res.json({ success: true, data: result.recordset[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, handleDbError(err), 'Failed to fetch profile.');
   }
@@ -408,42 +471,37 @@ app.put('/api/profile', async (req, res) => {
   try {
     const data = validateProfileBody(req.body);
 
-    const existing = await pool
-      .request()
-      .input('ProfileID', sql.Int, data.ProfileID)
-      .query('SELECT ProfileID FROM UserProfile WHERE ProfileID = @ProfileID');
+    const existing = await query(
+      'SELECT "ProfileID" FROM "UserProfile" WHERE "ProfileID" = $1',
+      [data.ProfileID]
+    );
 
     let result;
 
-    if (existing.recordset.length === 0) {
-      result = await pool
-        .request()
-        .input('FullName', sql.NVarChar(100), data.FullName)
-        .input('Height', sql.Decimal(5, 2), data.Height)
-        .input('TargetGoal', sql.NVarChar(255), data.TargetGoal)
-        .query(`
-          INSERT INTO UserProfile (FullName, Height, TargetGoal)
-          OUTPUT INSERTED.ProfileID, INSERTED.FullName, INSERTED.Height, INSERTED.TargetGoal
-          VALUES (@FullName, @Height, @TargetGoal)
-        `);
+    if (existing.rows.length === 0) {
+      result = await query(
+        `
+          INSERT INTO "UserProfile" ("FullName", "Height", "TargetGoal")
+          VALUES ($1, $2, $3)
+          RETURNING "ProfileID", "FullName", "Height", "TargetGoal"
+        `,
+        [data.FullName, data.Height, data.TargetGoal]
+      );
     } else {
-      result = await pool
-        .request()
-        .input('ProfileID', sql.Int, data.ProfileID)
-        .input('FullName', sql.NVarChar(100), data.FullName)
-        .input('Height', sql.Decimal(5, 2), data.Height)
-        .input('TargetGoal', sql.NVarChar(255), data.TargetGoal)
-        .query(`
-          UPDATE UserProfile
-          SET FullName = @FullName,
-              Height = @Height,
-              TargetGoal = @TargetGoal
-          OUTPUT INSERTED.ProfileID, INSERTED.FullName, INSERTED.Height, INSERTED.TargetGoal
-          WHERE ProfileID = @ProfileID
-        `);
+      result = await query(
+        `
+          UPDATE "UserProfile"
+          SET "FullName" = $1,
+              "Height" = $2,
+              "TargetGoal" = $3
+          WHERE "ProfileID" = $4
+          RETURNING "ProfileID", "FullName", "Height", "TargetGoal"
+        `,
+        [data.FullName, data.Height, data.TargetGoal, data.ProfileID]
+      );
     }
 
-    res.json({ success: true, data: result.recordset[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to update profile.');
   }
@@ -453,13 +511,13 @@ app.put('/api/profile', async (req, res) => {
 
 app.get('/api/weight', async (req, res) => {
   try {
-    const result = await pool.request().query(`
-      SELECT RecordID, RecordDate, Weight
-      FROM BodyWeightHistory
-      ORDER BY RecordDate DESC, RecordID DESC
+    const result = await query(`
+      SELECT "RecordID", "RecordDate", "Weight"
+      FROM "BodyWeightHistory"
+      ORDER BY "RecordDate" DESC, "RecordID" DESC
     `);
 
-    res.json({ success: true, data: result.recordset });
+    res.json({ success: true, data: result.rows });
   } catch (err) {
     sendError(res, handleDbError(err), 'Failed to fetch weight history.');
   }
@@ -469,17 +527,16 @@ app.post('/api/weight', async (req, res) => {
   try {
     const { RecordDate, Weight } = validateWeightBody(req.body);
 
-    const result = await pool
-      .request()
-      .input('RecordDate', sql.Date, RecordDate)
-      .input('Weight', sql.Decimal(6, 2), Weight)
-      .query(`
-        INSERT INTO BodyWeightHistory (RecordDate, Weight)
-        OUTPUT INSERTED.RecordID, INSERTED.RecordDate, INSERTED.Weight
-        VALUES (@RecordDate, @Weight)
-      `);
+    const result = await query(
+      `
+        INSERT INTO "BodyWeightHistory" ("RecordDate", "Weight")
+        VALUES ($1, $2)
+        RETURNING "RecordID", "RecordDate", "Weight"
+      `,
+      [RecordDate, Weight]
+    );
 
-    res.status(201).json({ success: true, data: result.recordset[0] });
+    res.status(201).json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to save weight record.');
   }
@@ -489,13 +546,13 @@ app.post('/api/weight', async (req, res) => {
 
 app.get('/api/exercises', async (req, res) => {
   try {
-    const result = await pool.request().query(`
-      SELECT ExerciseID, Name, MuscleGroup
-      FROM Exercises
-      ORDER BY Name
+    const result = await query(`
+      SELECT "ExerciseID", "Name", "MuscleGroup"
+      FROM "Exercises"
+      ORDER BY "Name"
     `);
 
-    res.json({ success: true, data: result.recordset });
+    res.json({ success: true, data: result.rows });
   } catch (err) {
     sendError(res, handleDbError(err), 'Failed to fetch exercises.');
   }
@@ -505,17 +562,16 @@ app.post('/api/exercises', async (req, res) => {
   try {
     const { Name, MuscleGroup } = validateExerciseBody(req.body);
 
-    const result = await pool
-      .request()
-      .input('Name', sql.NVarChar(100), Name)
-      .input('MuscleGroup', sql.NVarChar(100), MuscleGroup)
-      .query(`
-        INSERT INTO Exercises (Name, MuscleGroup)
-        OUTPUT INSERTED.ExerciseID, INSERTED.Name, INSERTED.MuscleGroup
-        VALUES (@Name, @MuscleGroup)
-      `);
+    const result = await query(
+      `
+        INSERT INTO "Exercises" ("Name", "MuscleGroup")
+        VALUES ($1, $2)
+        RETURNING "ExerciseID", "Name", "MuscleGroup"
+      `,
+      [Name, MuscleGroup]
+    );
 
-    res.status(201).json({ success: true, data: result.recordset[0] });
+    res.status(201).json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to create exercise.');
   }
@@ -525,11 +581,11 @@ app.post('/api/exercises', async (req, res) => {
 
 app.get('/api/default-schedule', async (req, res) => {
   try {
-    const result = await pool.request().query(`
+    const result = await query(`
       ${DEFAULT_SCHEDULE_SELECT}
-      ORDER BY ds.DayOfWeek ASC, ds.TemplateID ASC
+      ORDER BY ds."DayOfWeek" ASC, ds."TemplateID" ASC
     `);
-    res.json({ success: true, data: result.recordset });
+    res.json({ success: true, data: result.rows });
   } catch (err) {
     sendError(res, handleDbError(err), 'Failed to fetch default schedule.');
   }
@@ -538,19 +594,19 @@ app.get('/api/default-schedule', async (req, res) => {
 app.get('/api/default-schedule/:id', async (req, res) => {
   try {
     const id = parseId(req.params.id, 'TemplateID');
-    const result = await pool
-      .request()
-      .input('TemplateID', sql.Int, id)
-      .query(`${DEFAULT_SCHEDULE_SELECT} WHERE ds.TemplateID = @TemplateID`);
+    const result = await query(
+      `${DEFAULT_SCHEDULE_SELECT} WHERE ds."TemplateID" = $1`,
+      [id]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Default schedule entry with ID ${id} not found.`,
       });
     }
 
-    res.json({ success: true, data: result.recordset[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to fetch default schedule entry.');
   }
@@ -560,38 +616,34 @@ app.post('/api/default-schedule', async (req, res) => {
   try {
     const data = validateDefaultScheduleBody(req.body);
 
-    const exerciseExists = await pool
-      .request()
-      .input('ExerciseID', sql.Int, data.ExerciseID)
-      .query('SELECT 1 FROM Exercises WHERE ExerciseID = @ExerciseID');
+    const exerciseExists = await query(
+      'SELECT 1 FROM "Exercises" WHERE "ExerciseID" = $1',
+      [data.ExerciseID]
+    );
 
-    if (exerciseExists.recordset.length === 0) {
+    if (exerciseExists.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Exercise with ID ${data.ExerciseID} not found.`,
       });
     }
 
-    const insertResult = await pool
-      .request()
-      .input('DayOfWeek', sql.Int, data.DayOfWeek)
-      .input('ExerciseID', sql.Int, data.ExerciseID)
-      .input('Sets', sql.Int, data.Sets)
-      .input('Reps', sql.Int, data.Reps)
-      .input('Weight', sql.Decimal(10, 2), data.Weight)
-      .query(`
-        INSERT INTO DefaultWeeklySchedule (DayOfWeek, ExerciseID, Sets, Reps, Weight)
-        OUTPUT INSERTED.TemplateID
-        VALUES (@DayOfWeek, @ExerciseID, @Sets, @Reps, @Weight)
-      `);
+    const insertResult = await query(
+      `
+        INSERT INTO "DefaultWeeklySchedule" ("DayOfWeek", "ExerciseID", "Sets", "Reps", "Weight")
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING "TemplateID"
+      `,
+      [data.DayOfWeek, data.ExerciseID, data.Sets, data.Reps, data.Weight]
+    );
 
-    const templateId = insertResult.recordset[0].TemplateID;
-    const result = await pool
-      .request()
-      .input('TemplateID', sql.Int, templateId)
-      .query(`${DEFAULT_SCHEDULE_SELECT} WHERE ds.TemplateID = @TemplateID`);
+    const templateId = insertResult.rows[0].TemplateID;
+    const result = await query(
+      `${DEFAULT_SCHEDULE_SELECT} WHERE ds."TemplateID" = $1`,
+      [templateId]
+    );
 
-    res.status(201).json({ success: true, data: result.recordset[0] });
+    res.status(201).json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to create default schedule entry.');
   }
@@ -602,50 +654,45 @@ app.put('/api/default-schedule/:id', async (req, res) => {
     const id = parseId(req.params.id, 'TemplateID');
     const data = validateDefaultScheduleBody(req.body, { partial: false });
 
-    const exerciseExists = await pool
-      .request()
-      .input('ExerciseID', sql.Int, data.ExerciseID)
-      .query('SELECT 1 FROM Exercises WHERE ExerciseID = @ExerciseID');
+    const exerciseExists = await query(
+      'SELECT 1 FROM "Exercises" WHERE "ExerciseID" = $1',
+      [data.ExerciseID]
+    );
 
-    if (exerciseExists.recordset.length === 0) {
+    if (exerciseExists.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Exercise with ID ${data.ExerciseID} not found.`,
       });
     }
 
-    const updateResult = await pool
-      .request()
-      .input('TemplateID', sql.Int, id)
-      .input('DayOfWeek', sql.Int, data.DayOfWeek)
-      .input('ExerciseID', sql.Int, data.ExerciseID)
-      .input('Sets', sql.Int, data.Sets)
-      .input('Reps', sql.Int, data.Reps)
-      .input('Weight', sql.Decimal(10, 2), data.Weight)
-      .query(`
-        UPDATE DefaultWeeklySchedule
-        SET DayOfWeek = @DayOfWeek,
-            ExerciseID = @ExerciseID,
-            Sets = @Sets,
-            Reps = @Reps,
-            Weight = @Weight
-        OUTPUT INSERTED.TemplateID
-        WHERE TemplateID = @TemplateID
-      `);
+    const updateResult = await query(
+      `
+        UPDATE "DefaultWeeklySchedule"
+        SET "DayOfWeek" = $1,
+            "ExerciseID" = $2,
+            "Sets" = $3,
+            "Reps" = $4,
+            "Weight" = $5
+        WHERE "TemplateID" = $6
+        RETURNING "TemplateID"
+      `,
+      [data.DayOfWeek, data.ExerciseID, data.Sets, data.Reps, data.Weight, id]
+    );
 
-    if (updateResult.recordset.length === 0) {
+    if (updateResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Default schedule entry with ID ${id} not found.`,
       });
     }
 
-    const result = await pool
-      .request()
-      .input('TemplateID', sql.Int, id)
-      .query(`${DEFAULT_SCHEDULE_SELECT} WHERE ds.TemplateID = @TemplateID`);
+    const result = await query(
+      `${DEFAULT_SCHEDULE_SELECT} WHERE ds."TemplateID" = $1`,
+      [id]
+    );
 
-    res.json({ success: true, data: result.recordset[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to update default schedule entry.');
   }
@@ -654,14 +701,12 @@ app.put('/api/default-schedule/:id', async (req, res) => {
 app.delete('/api/default-schedule/:id', async (req, res) => {
   try {
     const id = parseId(req.params.id, 'TemplateID');
-    const result = await pool
-      .request()
-      .input('TemplateID', sql.Int, id)
-      .query(
-        'DELETE FROM DefaultWeeklySchedule OUTPUT DELETED.TemplateID WHERE TemplateID = @TemplateID'
-      );
+    const result = await query(
+      'DELETE FROM "DefaultWeeklySchedule" WHERE "TemplateID" = $1 RETURNING "TemplateID"',
+      [id]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Default schedule entry with ID ${id} not found.`,
@@ -684,28 +729,27 @@ app.get('/api/workouts', async (req, res) => {
     const filterDate = parseDateQuery(req.query.date);
     const startDate = parseDateQuery(req.query.startDate, 'startDate');
     const endDate = parseDateQuery(req.query.endDate, 'endDate');
-    const request = pool.request();
-    let query = `SELECT ${WORKOUT_COLUMNS} FROM Workouts`;
+    const params = [];
     const conditions = [];
+    let queryText = `SELECT ${WORKOUT_COLUMNS} FROM "Workouts"`;
 
     if (startDate && endDate) {
-      request.input('StartDate', sql.Date, new Date(startDate));
-      request.input('EndDate', sql.Date, new Date(endDate));
+      params.push(startDate, endDate);
       conditions.push(
-        'CAST(WorkoutDate AS DATE) >= @StartDate AND CAST(WorkoutDate AS DATE) <= @EndDate'
+        `CAST("WorkoutDate" AS DATE) >= $${params.length - 1}::date AND CAST("WorkoutDate" AS DATE) <= $${params.length}::date`
       );
     } else if (filterDate) {
-      request.input('FilterDate', sql.Date, new Date(filterDate));
-      conditions.push('CAST(WorkoutDate AS DATE) = @FilterDate');
+      params.push(filterDate);
+      conditions.push(`CAST("WorkoutDate" AS DATE) = $${params.length}::date`);
     }
 
     if (conditions.length > 0) {
-      query += ` WHERE ${conditions.join(' AND ')}`;
+      queryText += ` WHERE ${conditions.join(' AND ')}`;
     }
 
-    query += ' ORDER BY WorkoutDate ASC, WorkoutID ASC';
-    const result = await request.query(query);
-    res.json({ success: true, data: result.recordset });
+    queryText += ' ORDER BY "WorkoutDate" ASC, "WorkoutID" ASC';
+    const result = await query(queryText, params);
+    res.json({ success: true, data: result.rows });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to fetch workouts.');
   }
@@ -713,34 +757,32 @@ app.get('/api/workouts', async (req, res) => {
 
 app.get('/api/workouts/today-details', async (req, res) => {
   try {
-    const result = await pool.request().query(`
+    const result = await query(`
       SELECT
-        wd.DetailID,
-        wd.WorkoutID,
-        wd.ExerciseID,
-        wd.Sets,
-        wd.Reps,
-        wd.Weight,
-        wd.IsCompleted,
-        e.Name AS ExerciseName,
-        e.MuscleGroup,
-        w.WorkoutDate
-      FROM WorkoutDetails wd
-      INNER JOIN Workouts w ON wd.WorkoutID = w.WorkoutID
-      INNER JOIN Exercises e ON wd.ExerciseID = e.ExerciseID
-      WHERE CAST(w.WorkoutDate AS DATE) = CAST(GETDATE() AS DATE)
-      ORDER BY w.WorkoutID ASC, wd.DetailID ASC
+        wd."DetailID",
+        wd."WorkoutID",
+        wd."ExerciseID",
+        wd."Sets",
+        wd."Reps",
+        wd."Weight",
+        wd."IsCompleted",
+        e."Name" AS "ExerciseName",
+        e."MuscleGroup",
+        w."WorkoutDate"
+      FROM "WorkoutDetails" wd
+      INNER JOIN "Workouts" w ON wd."WorkoutID" = w."WorkoutID"
+      INNER JOIN "Exercises" e ON wd."ExerciseID" = e."ExerciseID"
+      WHERE CAST(w."WorkoutDate" AS DATE) = CURRENT_DATE
+      ORDER BY w."WorkoutID" ASC, wd."DetailID" ASC
     `);
 
-    res.json({ success: true, data: result.recordset });
+    res.json({ success: true, data: result.rows });
   } catch (err) {
     sendError(res, handleDbError(err), 'Failed to fetch today workout details.');
   }
 });
 
 app.post('/api/workouts/apply-default', async (req, res) => {
-  const transaction = new sql.Transaction(pool);
-
   try {
     const startDate = parseDateQuery(req.body.startDate, 'startDate');
     if (!startDate) {
@@ -749,13 +791,13 @@ app.post('/api/workouts/apply-default', async (req, res) => {
       throw error;
     }
 
-    const templatesResult = await pool.request().query(`
-      SELECT TemplateID, DayOfWeek, ExerciseID, Sets, Reps, Weight
-      FROM DefaultWeeklySchedule
-      ORDER BY DayOfWeek ASC, TemplateID ASC
+    const templatesResult = await query(`
+      SELECT "TemplateID", "DayOfWeek", "ExerciseID", "Sets", "Reps", "Weight"
+      FROM "DefaultWeeklySchedule"
+      ORDER BY "DayOfWeek" ASC, "TemplateID" ASC
     `);
 
-    const templates = templatesResult.recordset;
+    const templates = templatesResult.rows;
     if (templates.length === 0) {
       return res.json({
         success: true,
@@ -768,79 +810,79 @@ app.post('/api/workouts/apply-default', async (req, res) => {
       });
     }
 
-    await transaction.begin();
+    const txResult = await withTransaction(async (client) => {
+      let workoutsCreated = 0;
+      let detailsCreated = 0;
+      const workoutIdByDate = new Map();
 
-    let workoutsCreated = 0;
-    let detailsCreated = 0;
-    const workoutIdByDate = new Map();
+      for (const template of templates) {
+        const offset = dayOfWeekToOffset(template.DayOfWeek);
+        const workoutDate = addDaysToDate(startDate, offset);
+        const dateKey = formatDateKey(workoutDate);
 
-    for (const template of templates) {
-      const offset = dayOfWeekToOffset(template.DayOfWeek);
-      const workoutDate = addDaysToDate(startDate, offset);
-      const dateKey = formatDateKey(workoutDate);
+        let workoutId = workoutIdByDate.get(dateKey);
 
-      let workoutId = workoutIdByDate.get(dateKey);
+        if (!workoutId) {
+          const existing = await query(
+            `
+              SELECT "WorkoutID"
+              FROM "Workouts"
+              WHERE CAST("WorkoutDate" AS DATE) = CAST($1 AS DATE)
+              ORDER BY "WorkoutID" ASC
+              LIMIT 1
+            `,
+            [workoutDate],
+            client
+          );
 
-      if (!workoutId) {
-        const findRequest = new sql.Request(transaction);
-        const existing = await findRequest
-          .input('WorkoutDate', sql.Date, workoutDate)
-          .query(`
-            SELECT TOP 1 WorkoutID
-            FROM Workouts
-            WHERE CAST(WorkoutDate AS DATE) = CAST(@WorkoutDate AS DATE)
-            ORDER BY WorkoutID ASC
-          `);
+          if (existing.rows.length > 0) {
+            workoutId = existing.rows[0].WorkoutID;
+          } else {
+            const inserted = await query(
+              `
+                INSERT INTO "Workouts" ("WorkoutDate", "Notes", "IsCompleted")
+                VALUES ($1, $2, false)
+                RETURNING "WorkoutID"
+              `,
+              [workoutDate, `Buổi tập ${dateKey}`],
+              client
+            );
+            workoutId = inserted.rows[0].WorkoutID;
+            workoutsCreated += 1;
+          }
 
-        if (existing.recordset.length > 0) {
-          workoutId = existing.recordset[0].WorkoutID;
-        } else {
-          const insertWorkoutRequest = new sql.Request(transaction);
-          const inserted = await insertWorkoutRequest
-            .input('WorkoutDate', sql.Date, workoutDate)
-            .input('Notes', sql.NVarChar(sql.MAX), `Buổi tập ${dateKey}`)
-            .query(`
-              INSERT INTO Workouts (WorkoutDate, Notes, IsCompleted)
-              OUTPUT INSERTED.WorkoutID
-              VALUES (@WorkoutDate, @Notes, 0)
-            `);
-          workoutId = inserted.recordset[0].WorkoutID;
-          workoutsCreated += 1;
+          workoutIdByDate.set(dateKey, workoutId);
         }
 
-        workoutIdByDate.set(dateKey, workoutId);
+        await query(
+          `
+            INSERT INTO "WorkoutDetails" ("WorkoutID", "ExerciseID", "Sets", "Reps", "Weight", "IsCompleted")
+            VALUES ($1, $2, $3, $4, $5, false)
+          `,
+          [
+            workoutId,
+            template.ExerciseID,
+            template.Sets,
+            template.Reps,
+            template.Weight,
+          ],
+          client
+        );
+        detailsCreated += 1;
       }
 
-      const insertDetailRequest = new sql.Request(transaction);
-      await insertDetailRequest
-        .input('WorkoutID', sql.Int, workoutId)
-        .input('ExerciseID', sql.Int, template.ExerciseID)
-        .input('Sets', sql.Int, template.Sets)
-        .input('Reps', sql.Int, template.Reps)
-        .input('Weight', sql.Decimal(10, 2), template.Weight)
-        .query(`
-          INSERT INTO WorkoutDetails (WorkoutID, ExerciseID, Sets, Reps, Weight, IsCompleted)
-          VALUES (@WorkoutID, @ExerciseID, @Sets, @Reps, @Weight, 0)
-        `);
-      detailsCreated += 1;
-    }
-
-    await transaction.commit();
+      return { workoutsCreated, detailsCreated };
+    });
 
     res.json({
       success: true,
       data: {
         startDate,
-        workoutsCreated,
-        detailsCreated,
+        workoutsCreated: txResult.workoutsCreated,
+        detailsCreated: txResult.detailsCreated,
       },
     });
   } catch (err) {
-    try {
-      await transaction.rollback();
-    } catch (_) {
-      /* transaction may not have started */
-    }
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to apply default schedule.');
   }
 });
@@ -848,21 +890,19 @@ app.post('/api/workouts/apply-default', async (req, res) => {
 app.get('/api/workouts/:id', async (req, res) => {
   try {
     const id = parseId(req.params.id, 'WorkoutID');
-    const result = await pool
-      .request()
-      .input('WorkoutID', sql.Int, id)
-      .query(
-        `SELECT ${WORKOUT_COLUMNS} FROM Workouts WHERE WorkoutID = @WorkoutID`
-      );
+    const result = await query(
+      `SELECT ${WORKOUT_COLUMNS} FROM "Workouts" WHERE "WorkoutID" = $1`,
+      [id]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Workout with ID ${id} not found.`,
       });
     }
 
-    res.json({ success: true, data: result.recordset[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to fetch workout.');
   }
@@ -872,17 +912,16 @@ app.post('/api/workouts', async (req, res) => {
   try {
     const { WorkoutDate, Notes } = validateWorkoutBody(req.body);
 
-    const result = await pool
-      .request()
-      .input('WorkoutDate', sql.Date, WorkoutDate)
-      .input('Notes', sql.NVarChar(sql.MAX), Notes)
-      .query(`
-        INSERT INTO Workouts (WorkoutDate, Notes, IsCompleted)
-        OUTPUT INSERTED.WorkoutID, INSERTED.WorkoutDate, INSERTED.Notes, INSERTED.IsCompleted
-        VALUES (@WorkoutDate, @Notes, 0)
-      `);
+    const result = await query(
+      `
+        INSERT INTO "Workouts" ("WorkoutDate", "Notes", "IsCompleted")
+        VALUES ($1, $2, false)
+        RETURNING ${WORKOUT_COLUMNS}
+      `,
+      [WorkoutDate, Notes]
+    );
 
-    res.status(201).json({ success: true, data: result.recordset[0] });
+    res.status(201).json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to create workout.');
   }
@@ -893,26 +932,24 @@ app.put('/api/workouts/:id', async (req, res) => {
     const id = parseId(req.params.id, 'WorkoutID');
     const { WorkoutDate, Notes } = validateWorkoutBody(req.body, { partial: false });
 
-    const result = await pool
-      .request()
-      .input('WorkoutID', sql.Int, id)
-      .input('WorkoutDate', sql.Date, WorkoutDate)
-      .input('Notes', sql.NVarChar(sql.MAX), Notes)
-      .query(`
-        UPDATE Workouts
-        SET WorkoutDate = @WorkoutDate, Notes = @Notes
-        OUTPUT INSERTED.WorkoutID, INSERTED.WorkoutDate, INSERTED.Notes, INSERTED.IsCompleted
-        WHERE WorkoutID = @WorkoutID
-      `);
+    const result = await query(
+      `
+        UPDATE "Workouts"
+        SET "WorkoutDate" = $1, "Notes" = $2
+        WHERE "WorkoutID" = $3
+        RETURNING ${WORKOUT_COLUMNS}
+      `,
+      [WorkoutDate, Notes, id]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Workout with ID ${id} not found.`,
       });
     }
 
-    res.json({ success: true, data: result.recordset[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to update workout.');
   }
@@ -923,106 +960,103 @@ app.put('/api/workouts/:id/complete', async (req, res) => {
     const id = parseId(req.params.id, 'WorkoutID');
     const isCompleted = parseIsCompleted(req.body.IsCompleted);
 
-    const result = await pool
-      .request()
-      .input('WorkoutID', sql.Int, id)
-      .input('IsCompleted', sql.Bit, isCompleted)
-      .query(`
-        UPDATE Workouts
-        SET IsCompleted = @IsCompleted
-        OUTPUT INSERTED.WorkoutID, INSERTED.WorkoutDate, INSERTED.Notes, INSERTED.IsCompleted
-        WHERE WorkoutID = @WorkoutID
-      `);
+    const result = await query(
+      `
+        UPDATE "Workouts"
+        SET "IsCompleted" = $1
+        WHERE "WorkoutID" = $2
+        RETURNING ${WORKOUT_COLUMNS}
+      `,
+      [isCompleted, id]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Workout with ID ${id} not found.`,
       });
     }
 
-    res.json({ success: true, data: result.recordset[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to update workout completion.');
   }
 });
 
 app.delete('/api/workouts/:id', async (req, res) => {
-  const transaction = new sql.Transaction(pool);
-
   try {
     const id = parseId(req.params.id, 'WorkoutID');
-    await transaction.begin();
 
-    const deleteDetailsRequest = new sql.Request(transaction);
-    await deleteDetailsRequest
-      .input('WorkoutID', sql.Int, id)
-      .query('DELETE FROM WorkoutDetails WHERE WorkoutID = @WorkoutID');
+    const deleted = await withTransaction(async (client) => {
+      await query(
+        'DELETE FROM "WorkoutDetails" WHERE "WorkoutID" = $1',
+        [id],
+        client
+      );
 
-    const deleteWorkoutRequest = new sql.Request(transaction);
-    const result = await deleteWorkoutRequest
-      .input('WorkoutID', sql.Int, id)
-      .query('DELETE FROM Workouts OUTPUT DELETED.WorkoutID WHERE WorkoutID = @WorkoutID');
+      const result = await query(
+        'DELETE FROM "Workouts" WHERE "WorkoutID" = $1 RETURNING "WorkoutID"',
+        [id],
+        client
+      );
 
-    if (result.recordset.length === 0) {
-      await transaction.rollback();
+      return result;
+    });
+
+    if (deleted.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Workout with ID ${id} not found.`,
       });
     }
 
-    await transaction.commit();
     res.json({
       success: true,
       message: `Workout with ID ${id} and its details were deleted.`,
     });
   } catch (err) {
-    try {
-      await transaction.rollback();
-    } catch (_) {
-      /* transaction may not have started */
-    }
-    sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to delete workout.');
+    sendError(res, handleDbError(err), 'Failed to delete workout.');
   }
 });
 
 // --- WorkoutDetails ---
 
+const WORKOUT_DETAIL_COLUMNS =
+  '"DetailID", "WorkoutID", "ExerciseID", "Sets", "Reps", "Weight", "IsCompleted"';
+
 app.get('/api/workout-details', async (req, res) => {
   try {
-    const request = pool.request();
     const startDate = parseDateQuery(req.query.startDate, 'startDate');
     const endDate = parseDateQuery(req.query.endDate, 'endDate');
-    let query = `
-      SELECT wd.DetailID, wd.WorkoutID, wd.ExerciseID, wd.Sets, wd.Reps, wd.Weight,
-             wd.IsCompleted, w.WorkoutDate
-      FROM WorkoutDetails wd
-      INNER JOIN Workouts w ON wd.WorkoutID = w.WorkoutID
-    `;
+    const params = [];
     const conditions = [];
+    let queryText = `
+      SELECT wd."DetailID", wd."WorkoutID", wd."ExerciseID", wd."Sets", wd."Reps", wd."Weight",
+             wd."IsCompleted", w."WorkoutDate"
+      FROM "WorkoutDetails" wd
+      INNER JOIN "Workouts" w ON wd."WorkoutID" = w."WorkoutID"
+    `;
 
     if (req.query.workoutId !== undefined) {
       const workoutId = parseId(req.query.workoutId, 'WorkoutID');
-      request.input('WorkoutID', sql.Int, workoutId);
-      conditions.push('wd.WorkoutID = @WorkoutID');
+      params.push(workoutId);
+      conditions.push(`wd."WorkoutID" = $${params.length}`);
     }
 
     if (startDate && endDate) {
-      request.input('StartDate', sql.Date, new Date(startDate));
-      request.input('EndDate', sql.Date, new Date(endDate));
+      params.push(startDate, endDate);
       conditions.push(
-        'CAST(w.WorkoutDate AS DATE) >= @StartDate AND CAST(w.WorkoutDate AS DATE) <= @EndDate'
+        `CAST(w."WorkoutDate" AS DATE) >= $${params.length - 1}::date AND CAST(w."WorkoutDate" AS DATE) <= $${params.length}::date`
       );
     }
 
     if (conditions.length > 0) {
-      query += ` WHERE ${conditions.join(' AND ')}`;
+      queryText += ` WHERE ${conditions.join(' AND ')}`;
     }
 
-    query += ' ORDER BY w.WorkoutDate ASC, wd.DetailID ASC';
-    const result = await request.query(query);
-    res.json({ success: true, data: result.recordset });
+    queryText += ' ORDER BY w."WorkoutDate" ASC, wd."DetailID" ASC';
+    const result = await query(queryText, params);
+    res.json({ success: true, data: result.rows });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to fetch workout details.');
   }
@@ -1031,23 +1065,23 @@ app.get('/api/workout-details', async (req, res) => {
 app.get('/api/workout-details/:id', async (req, res) => {
   try {
     const id = parseId(req.params.id, 'DetailID');
-    const result = await pool
-      .request()
-      .input('DetailID', sql.Int, id)
-      .query(`
-        SELECT DetailID, WorkoutID, ExerciseID, Sets, Reps, Weight, IsCompleted
-        FROM WorkoutDetails
-        WHERE DetailID = @DetailID
-      `);
+    const result = await query(
+      `
+        SELECT ${WORKOUT_DETAIL_COLUMNS}
+        FROM "WorkoutDetails"
+        WHERE "DetailID" = $1
+      `,
+      [id]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Workout detail with ID ${id} not found.`,
       });
     }
 
-    res.json({ success: true, data: result.recordset[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to fetch workout detail.');
   }
@@ -1057,33 +1091,28 @@ app.post('/api/workout-details', async (req, res) => {
   try {
     const data = validateWorkoutDetailBody(req.body);
 
-    const workoutExists = await pool
-      .request()
-      .input('WorkoutID', sql.Int, data.WorkoutID)
-      .query('SELECT 1 FROM Workouts WHERE WorkoutID = @WorkoutID');
+    const workoutExists = await query(
+      'SELECT 1 FROM "Workouts" WHERE "WorkoutID" = $1',
+      [data.WorkoutID]
+    );
 
-    if (workoutExists.recordset.length === 0) {
+    if (workoutExists.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Workout with ID ${data.WorkoutID} not found.`,
       });
     }
 
-    const result = await pool
-      .request()
-      .input('WorkoutID', sql.Int, data.WorkoutID)
-      .input('ExerciseID', sql.Int, data.ExerciseID)
-      .input('Sets', sql.Int, data.Sets)
-      .input('Reps', sql.Int, data.Reps)
-      .input('Weight', sql.Decimal(10, 2), data.Weight)
-      .query(`
-        INSERT INTO WorkoutDetails (WorkoutID, ExerciseID, Sets, Reps, Weight, IsCompleted)
-        OUTPUT INSERTED.DetailID, INSERTED.WorkoutID, INSERTED.ExerciseID,
-               INSERTED.Sets, INSERTED.Reps, INSERTED.Weight, INSERTED.IsCompleted
-        VALUES (@WorkoutID, @ExerciseID, @Sets, @Reps, @Weight, 0)
-      `);
+    const result = await query(
+      `
+        INSERT INTO "WorkoutDetails" ("WorkoutID", "ExerciseID", "Sets", "Reps", "Weight", "IsCompleted")
+        VALUES ($1, $2, $3, $4, $5, false)
+        RETURNING ${WORKOUT_DETAIL_COLUMNS}
+      `,
+      [data.WorkoutID, data.ExerciseID, data.Sets, data.Reps, data.Weight]
+    );
 
-    res.status(201).json({ success: true, data: result.recordset[0] });
+    res.status(201).json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to create workout detail.');
   }
@@ -1095,12 +1124,12 @@ app.put('/api/workout-details/:id', async (req, res) => {
     const data = validateWorkoutDetailBody(req.body, { partial: false });
 
     if (data.WorkoutID !== undefined) {
-      const workoutExists = await pool
-        .request()
-        .input('WorkoutID', sql.Int, data.WorkoutID)
-        .query('SELECT 1 FROM Workouts WHERE WorkoutID = @WorkoutID');
+      const workoutExists = await query(
+        'SELECT 1 FROM "Workouts" WHERE "WorkoutID" = $1',
+        [data.WorkoutID]
+      );
 
-      if (workoutExists.recordset.length === 0) {
+      if (workoutExists.rows.length === 0) {
         return res.status(404).json({
           success: false,
           message: `Workout with ID ${data.WorkoutID} not found.`,
@@ -1108,34 +1137,28 @@ app.put('/api/workout-details/:id', async (req, res) => {
       }
     }
 
-    const result = await pool
-      .request()
-      .input('DetailID', sql.Int, id)
-      .input('WorkoutID', sql.Int, data.WorkoutID)
-      .input('ExerciseID', sql.Int, data.ExerciseID)
-      .input('Sets', sql.Int, data.Sets)
-      .input('Reps', sql.Int, data.Reps)
-      .input('Weight', sql.Decimal(10, 2), data.Weight)
-      .query(`
-        UPDATE WorkoutDetails
-        SET WorkoutID = @WorkoutID,
-            ExerciseID = @ExerciseID,
-            Sets = @Sets,
-            Reps = @Reps,
-            Weight = @Weight
-        OUTPUT INSERTED.DetailID, INSERTED.WorkoutID, INSERTED.ExerciseID,
-               INSERTED.Sets, INSERTED.Reps, INSERTED.Weight, INSERTED.IsCompleted
-        WHERE DetailID = @DetailID
-      `);
+    const result = await query(
+      `
+        UPDATE "WorkoutDetails"
+        SET "WorkoutID" = $1,
+            "ExerciseID" = $2,
+            "Sets" = $3,
+            "Reps" = $4,
+            "Weight" = $5
+        WHERE "DetailID" = $6
+        RETURNING ${WORKOUT_DETAIL_COLUMNS}
+      `,
+      [data.WorkoutID, data.ExerciseID, data.Sets, data.Reps, data.Weight, id]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Workout detail with ID ${id} not found.`,
       });
     }
 
-    res.json({ success: true, data: result.recordset[0] });
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     sendError(res, err.statusCode ? err : handleDbError(err), 'Failed to update workout detail.');
   }
@@ -1146,51 +1169,48 @@ app.put('/api/workout-details/:id/complete', async (req, res) => {
     const id = parseId(req.params.id, 'DetailID');
     const isCompleted = parseIsCompleted(req.body.IsCompleted);
 
-    const result = await pool
-      .request()
-      .input('DetailID', sql.Int, id)
-      .input('IsCompleted', sql.Bit, isCompleted)
-      .query(`
-        UPDATE WorkoutDetails
-        SET IsCompleted = @IsCompleted
-        OUTPUT INSERTED.DetailID, INSERTED.WorkoutID, INSERTED.ExerciseID,
-               INSERTED.Sets, INSERTED.Reps, INSERTED.Weight, INSERTED.IsCompleted
-        WHERE DetailID = @DetailID
-      `);
+    const result = await query(
+      `
+        UPDATE "WorkoutDetails"
+        SET "IsCompleted" = $1
+        WHERE "DetailID" = $2
+        RETURNING ${WORKOUT_DETAIL_COLUMNS}
+      `,
+      [isCompleted, id]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Workout detail with ID ${id} not found.`,
       });
     }
 
-    const updatedDetail = result.recordset[0];
+    const updatedDetail = result.rows[0];
     const workoutId = updatedDetail.WorkoutID;
 
-    const summaryResult = await pool
-      .request()
-      .input('WorkoutID', sql.Int, workoutId)
-      .query(`
+    const summaryResult = await query(
+      `
         SELECT
-          COUNT(*) AS TotalDetails,
-          SUM(CASE WHEN IsCompleted = 1 THEN 1 ELSE 0 END) AS CompletedDetails
-        FROM WorkoutDetails
-        WHERE WorkoutID = @WorkoutID
-      `);
+          COUNT(*)::int AS "TotalDetails",
+          SUM(CASE WHEN "IsCompleted" THEN 1 ELSE 0 END)::int AS "CompletedDetails"
+        FROM "WorkoutDetails"
+        WHERE "WorkoutID" = $1
+      `,
+      [workoutId]
+    );
 
-    const { TotalDetails, CompletedDetails } = summaryResult.recordset[0];
+    const { TotalDetails, CompletedDetails } = summaryResult.rows[0];
     const workoutComplete = isWorkoutSessionComplete(TotalDetails, CompletedDetails);
 
-    await pool
-      .request()
-      .input('WorkoutID', sql.Int, workoutId)
-      .input('IsCompleted', sql.Bit, workoutComplete)
-      .query(`
-        UPDATE Workouts
-        SET IsCompleted = @IsCompleted
-        WHERE WorkoutID = @WorkoutID
-      `);
+    await query(
+      `
+        UPDATE "Workouts"
+        SET "IsCompleted" = $1
+        WHERE "WorkoutID" = $2
+      `,
+      [workoutComplete, workoutId]
+    );
 
     res.json({
       success: true,
@@ -1206,48 +1226,44 @@ app.delete('/api/workout-details/:id', async (req, res) => {
   try {
     const id = parseId(req.params.id, 'DetailID');
 
-    const existing = await pool
-      .request()
-      .input('DetailID', sql.Int, id)
-      .query('SELECT WorkoutID FROM WorkoutDetails WHERE DetailID = @DetailID');
+    const existing = await query(
+      'SELECT "WorkoutID" FROM "WorkoutDetails" WHERE "DetailID" = $1',
+      [id]
+    );
 
-    if (existing.recordset.length === 0) {
+    if (existing.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: `Workout detail with ID ${id} not found.`,
       });
     }
 
-    const workoutId = existing.recordset[0].WorkoutID;
+    const workoutId = existing.rows[0].WorkoutID;
 
-    await pool
-      .request()
-      .input('DetailID', sql.Int, id)
-      .query('DELETE FROM WorkoutDetails WHERE DetailID = @DetailID');
+    await query('DELETE FROM "WorkoutDetails" WHERE "DetailID" = $1', [id]);
 
-    const summaryResult = await pool
-      .request()
-      .input('WorkoutID', sql.Int, workoutId)
-      .query(`
+    const summaryResult = await query(
+      `
         SELECT
-          COUNT(*) AS TotalDetails,
-          SUM(CASE WHEN IsCompleted = 1 THEN 1 ELSE 0 END) AS CompletedDetails
-        FROM WorkoutDetails
-        WHERE WorkoutID = @WorkoutID
-      `);
+          COUNT(*)::int AS "TotalDetails",
+          SUM(CASE WHEN "IsCompleted" THEN 1 ELSE 0 END)::int AS "CompletedDetails"
+        FROM "WorkoutDetails"
+        WHERE "WorkoutID" = $1
+      `,
+      [workoutId]
+    );
 
-    const { TotalDetails, CompletedDetails } = summaryResult.recordset[0];
+    const { TotalDetails, CompletedDetails } = summaryResult.rows[0];
     const workoutComplete = isWorkoutSessionComplete(TotalDetails, CompletedDetails);
 
-    await pool
-      .request()
-      .input('WorkoutID', sql.Int, workoutId)
-      .input('IsCompleted', sql.Bit, workoutComplete)
-      .query(`
-        UPDATE Workouts
-        SET IsCompleted = @IsCompleted
-        WHERE WorkoutID = @WorkoutID
-      `);
+    await query(
+      `
+        UPDATE "Workouts"
+        SET "IsCompleted" = $1
+        WHERE "WorkoutID" = $2
+      `,
+      [workoutComplete, workoutId]
+    );
 
     res.json({
       success: true,
@@ -1270,42 +1286,43 @@ app.get('/api/statistics', async (req, res) => {
       topExercisesResult,
       weightResult,
     ] = await Promise.all([
-      pool.request().query(`
+      query(`
         SELECT
-          (SELECT COUNT(*) FROM Workouts) AS TotalWorkouts,
-          (SELECT COUNT(*) FROM Workouts WHERE IsCompleted = 1) AS CompletedWorkouts,
-          (SELECT ISNULL(SUM(CAST(Sets AS FLOAT) * Reps * Weight), 0) FROM WorkoutDetails) AS TotalVolumeKg,
-          (SELECT COUNT(*) FROM WorkoutDetails) AS TotalSets,
-          (SELECT COUNT(*) FROM Exercises) AS TotalExercises
+          (SELECT COUNT(*)::int FROM "Workouts") AS "TotalWorkouts",
+          (SELECT COUNT(*)::int FROM "Workouts" WHERE "IsCompleted" = true) AS "CompletedWorkouts",
+          (SELECT COALESCE(SUM("Sets"::float * "Reps" * "Weight"), 0) FROM "WorkoutDetails") AS "TotalVolumeKg",
+          (SELECT COUNT(*)::int FROM "WorkoutDetails") AS "TotalSets",
+          (SELECT COUNT(*)::int FROM "Exercises") AS "TotalExercises"
       `),
-      pool.request().query(`
+      query(`
         SELECT
-          FORMAT(WorkoutDate, 'yyyy-MM') AS Month,
-          COUNT(*) AS Total,
-          SUM(CASE WHEN IsCompleted = 1 THEN 1 ELSE 0 END) AS Completed
-        FROM Workouts
-        GROUP BY FORMAT(WorkoutDate, 'yyyy-MM')
-        ORDER BY Month
+          TO_CHAR("WorkoutDate", 'YYYY-MM') AS "Month",
+          COUNT(*)::int AS "Total",
+          SUM(CASE WHEN "IsCompleted" THEN 1 ELSE 0 END)::int AS "Completed"
+        FROM "Workouts"
+        GROUP BY TO_CHAR("WorkoutDate", 'YYYY-MM')
+        ORDER BY "Month"
       `),
-      pool.request().query(`
-        SELECT TOP 8
-          e.Name,
-          e.MuscleGroup,
-          COUNT(*) AS UsageCount,
-          ISNULL(SUM(CAST(wd.Sets AS FLOAT) * wd.Reps * wd.Weight), 0) AS TotalVolumeKg
-        FROM WorkoutDetails wd
-        INNER JOIN Exercises e ON wd.ExerciseID = e.ExerciseID
-        GROUP BY e.Name, e.MuscleGroup
-        ORDER BY UsageCount DESC, TotalVolumeKg DESC
+      query(`
+        SELECT
+          e."Name",
+          e."MuscleGroup",
+          COUNT(*)::int AS "UsageCount",
+          COALESCE(SUM(wd."Sets"::float * wd."Reps" * wd."Weight"), 0) AS "TotalVolumeKg"
+        FROM "WorkoutDetails" wd
+        INNER JOIN "Exercises" e ON wd."ExerciseID" = e."ExerciseID"
+        GROUP BY e."Name", e."MuscleGroup"
+        ORDER BY "UsageCount" DESC, "TotalVolumeKg" DESC
+        LIMIT 8
       `),
-      pool.request().query(`
-        SELECT RecordID, RecordDate, Weight
-        FROM BodyWeightHistory
-        ORDER BY RecordDate ASC, RecordID ASC
+      query(`
+        SELECT "RecordID", "RecordDate", "Weight"
+        FROM "BodyWeightHistory"
+        ORDER BY "RecordDate" ASC, "RecordID" ASC
       `),
     ]);
 
-    const summary = summaryResult.recordset[0];
+    const summary = summaryResult.rows[0];
     const totalWorkouts = summary.TotalWorkouts || 0;
     const completedWorkouts = summary.CompletedWorkouts || 0;
 
@@ -1323,9 +1340,9 @@ app.get('/api/statistics', async (req, res) => {
           totalSets: summary.TotalSets || 0,
           totalExercises: summary.TotalExercises || 0,
         },
-        workoutsByMonth: monthlyResult.recordset,
-        topExercises: topExercisesResult.recordset,
-        weightHistory: weightResult.recordset,
+        workoutsByMonth: monthlyResult.rows,
+        topExercises: topExercisesResult.rows,
+        weightHistory: weightResult.rows,
       },
     });
   } catch (err) {
@@ -1343,11 +1360,12 @@ app.use((req, res) => {
 
 async function connectDatabase() {
   try {
-    pool = await sql.connect(dbConfig);
+    pool = new Pool(buildPoolConfig());
+    await pool.query('SELECT 1');
     console.log('Database connected successfully');
     return pool;
   } catch (err) {
-    console.error('Database connection failed:', err.message);
+    console.error('Database connection failed:', formatConnectionError(err));
     process.exit(1);
   }
 }
