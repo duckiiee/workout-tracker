@@ -15,8 +15,9 @@ const dbConfig = {
   host: 'db.glcydvwcipxapugljsen.supabase.co',
   database: 'postgres',
   password: 'Hoangduc02@',
-  port: 5432,
+  port: 6543,
   ssl: { rejectUnauthorized: false },
+  family: 4
 };
 
 let pool;
